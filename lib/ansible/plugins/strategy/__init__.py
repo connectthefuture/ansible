@@ -244,7 +244,7 @@ class StrategyBase:
             else:
                 return self._inventory.get_host(host_name)
 
-        def search_handler_blocks(handler_name, handler_blocks):
+        def search_handler_blocks_by_name(handler_name, handler_blocks):
             for handler_block in handler_blocks:
                 for handler_task in handler_block.block:
                     if handler_task.name:
@@ -268,11 +268,14 @@ class StrategyBase:
                             # set_fact or some other method, and we don't want to error
                             # out unnecessarily
                             continue
-                    else:
-                        # if the handler name is not set, we check via the handlers uuid.
-                        # this is mainly used by listening handlers only
-                        if handler_name == handler_task._uuid:
-                            return handler_task
+            return None
+
+
+        def search_handler_blocks_by_uuid(handler_uuid, handler_blocks):
+            for handler_block in handler_blocks:
+                for handler_task in handler_block.block:
+                    if handler_uuid == handler_task._uuid:
+                        return handler_task
             return None
 
         def parent_handler_match(target_handler, handler_name):
@@ -294,6 +297,11 @@ class StrategyBase:
             else:
                 return False
 
+        # a Templar class to use for templating things later, as we're using
+        # original/non-validated objects here on the manager side. We set the
+        # variables in use later inside the loop below
+        templar = Templar(loader=self._loader)
+
         cur_pass = 0
         while True:
             try:
@@ -304,10 +312,28 @@ class StrategyBase:
             finally:
                 self._results_lock.release()
 
+            # get the original host and task, but then make a copy of the task so we can
+            # modify it via post-validate later. We then assign the "originals" to the
+            # TaskResult for use in callbacks/etc.
             original_host = get_original_host(task_result._host)
             original_task = iterator.get_original_task(original_host, task_result._task)
+            task_copy = original_task.copy(exclude_parent=True, exclude_tasks=True)
+            task_copy._parent = original_task._parent
+            original_task = task_copy
+            
             task_result._host = original_host
             task_result._task = original_task
+
+            # get the vars for this task/host pair, make them the active set of vars
+            # for our templar above, and post-validate the copy of the original task
+            task_vars = self._variable_manager.get_vars(loader=self._loader, play=iterator._play, host=original_host, task=original_task)
+            templar.set_available_variables(task_vars)
+
+            try:
+                templar._fail_on_undefined_errors = False
+                original_task.post_validate(templar)
+            finally:
+                templar._fail_on_undefined_errors = True
 
             # send callbacks for 'non final' results
             if '_ansible_retry' in task_result._result:
@@ -404,37 +430,39 @@ class StrategyBase:
                             # So, per the docs, we reassign the list so the proxy picks up and
                             # notifies all other threads
                             for handler_name in result_item['_ansible_notify']:
+                                print("TRYING TO SEND NOTIFICATION TO HANDLER: %s" % handler_name)
                                 found = False
                                 # Find the handler using the above helper.  First we look up the
                                 # dependency chain of the current task (if it's from a role), otherwise
                                 # we just look through the list of handlers in the current play/all
                                 # roles and use the first one that matches the notify name
-                                target_handler = search_handler_blocks(handler_name, iterator._play.handlers)
+                                target_handler = search_handler_blocks_by_name(handler_name, iterator._play.handlers)
                                 if target_handler is not None:
                                     found = True
-                                    if original_host not in self._notified_handlers[target_handler]:
-                                        self._notified_handlers[target_handler].append(original_host)
+                                    if original_host._uuid not in self._notified_handlers[target_handler._uuid]:
+                                        self._notified_handlers[target_handler._uuid].append(original_host)
                                         # FIXME: should this be a callback?
                                         display.vv("NOTIFIED HANDLER %s" % (handler_name,))
                                 else:
                                     # As there may be more than one handler with the notified name as the
                                     # parent, so we just keep track of whether or not we found one at all
-                                    for target_handler in self._notified_handlers:
-                                        if parent_handler_match(target_handler, handler_name):
-                                            self._notified_handlers[target_handler].append(original_host)
+                                    for target_handler_uuid in self._notified_handlers:
+                                        target_handler = search_handler_blocks_by_uuid(target_handler_uuid, iterator._play.handlers)
+                                        if target_handler and parent_handler_match(target_handler, handler_name):
+                                            self._notified_handlers[target_handler._uuid].append(original_host)
                                             display.vv("NOTIFIED HANDLER %s" % (target_handler.get_name(),))
                                             found = True
 
                                 if handler_name in self._listening_handlers:
-                                    for listening_handler_name in self._listening_handlers[handler_name]:
-                                        listening_handler = search_handler_blocks(listening_handler_name, iterator._play.handlers)
+                                    for listening_handler_uuid in self._listening_handlers[handler_name]:
+                                        listening_handler = search_handler_blocks_by_uuid(listening_handler_uuid, iterator._play.handlers)
                                         if listening_handler is not None:
                                             found = True
                                         else:
                                             continue
-                                        if original_host not in self._notified_handlers[listening_handler]:
-                                            self._notified_handlers[listening_handler].append(original_host)
-                                            display.vv("NOTIFIED HANDLER %s" % (listening_handler_name,))
+                                        if original_host not in self._notified_handlers[listening_handler._uuid]:
+                                            self._notified_handlers[listening_handler._uuid].append(original_host)
+                                            display.vv("NOTIFIED HANDLER %s" % (listening_handler.get_name(),))
 
                                 # and if none were found, then we raise an error
                                 if not found:
@@ -465,11 +493,9 @@ class StrategyBase:
 
                         # if delegated fact and we are delegating facts, we need to change target host for them
                         if original_task.delegate_to is not None and original_task.delegate_facts:
-                            task_vars = self._variable_manager.get_vars(loader=self._loader, play=iterator._play, host=original_host, task=original_task)
                             self.add_tqm_variables(task_vars, play=iterator._play)
                             if item is not None:
                                 task_vars[loop_var] = item
-                            templar = Templar(loader=self._loader, variables=task_vars)
                             host_name = templar.template(original_task.delegate_to)
                             actual_host = self._inventory.get_host(host_name)
                             if actual_host is None:
@@ -719,7 +745,7 @@ class StrategyBase:
             #        but this may take some work in the iterator and gets tricky when
             #        we consider the ability of meta tasks to flush handlers
             for handler in handler_block.block:
-                if handler in self._notified_handlers and len(self._notified_handlers[handler]):
+                if handler._uuid in self._notified_handlers and len(self._notified_handlers[handler._uuid]):
                     result = self._do_handler_run(handler, handler.get_name(), iterator=iterator, play_context=play_context)
                     if not result:
                         break
@@ -738,7 +764,7 @@ class StrategyBase:
         handler.name = saved_name
 
         if notified_hosts is None:
-            notified_hosts = self._notified_handlers[handler]
+            notified_hosts = self._notified_handlers[handler._uuid]
 
         run_once = False
         try:
@@ -802,7 +828,7 @@ class StrategyBase:
                     continue
 
         # wipe the notification list
-        self._notified_handlers[handler] = []
+        self._notified_handlers[handler._uuid] = []
         display.debug("done running handlers, result is: %s" % result)
         return result
 
